@@ -2,29 +2,39 @@ import asyncio
 import websockets
 import json
 import pyaudio
+import threading
+import queue
 
 URI = "ws://localhost:50007"
 
+audio_queue = queue.Queue()
+
+def audio_player(stream):
+    while True:
+        data = audio_queue.get()
+        if data is None:
+            break
+        stream.write(data, exception_on_underflow=False)
+
 async def receive_audio():
-    async with websockets.connect(URI) as websocket:
-        #Pede para começar a tocar
+    async with websockets.connect(
+        URI,
+        max_size=None,
+        ping_interval=None
+    ) as websocket:
+        print("Conectado ao servidor")
+
         await websocket.send("Quero desafiar a gravidade!")
 
-        #Recebe cabeçalho/header (informações da música)
-        header_msg = await websocket.recv()
-        if isinstance(header_msg, bytes):
-            header_msg = header_msg.decode("utf-8")
-        header = json.loads(header_msg)
-
-        if header.get("type") != "audio_header":
-            print("ERRO! Sem header.")
-            return
+        # Recebe cabeçalho/header (informações da música)
+        header = json.loads(await websocket.recv())
 
         rate = header["rate"]
         channels = header["channels"]
         sample_width = header["sample_width"]
+        chunk_frames = header["chunk_frames"]
 
-        print(f"Header recebido: rate={rate}, channels={channels}, width={sample_width}")
+        print("Header recebido:", rate, channels, sample_width)
 
         # Configura PyAudio
         p = pyaudio.PyAudio()
@@ -33,28 +43,34 @@ async def receive_audio():
             channels=channels,
             rate=rate,
             output=True,
+            frames_per_buffer=chunk_frames
         )
 
-        try:
-            while True:
-                msg = await websocket.recv()
+        player = threading.Thread(
+            target=audio_player,
+            args=(stream,),
+            daemon=True
+        )
+        player.start()
 
-                # Pode ser texto (JSON) ou binário (dados de áudio)
-                if isinstance(msg, bytes):
-                    # Dados de áudio
-                    stream.write(msg)
-                else:
-                    data = json.loads(msg)
-                    if data.get("type") == "end":
-                        print("Fim da música recebido.")
-                        break
-                    elif data.get("type") == "error":
-                        print("Erro do servidor:", data.get("message"))
-                        break
-        finally:
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
+        # Para recepção contínua
+        while True:
+            msg = await websocket.recv()
+
+            if isinstance(msg, bytes):
+                audio_queue.put(msg)
+            else:
+                data = json.loads(msg)
+                if data.get("type") == "end":
+                    audio_queue.put(None)
+                    break
+
+        player.join()
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+
+        print("Música completa tocada")
 
 if __name__ == "__main__":
     asyncio.run(receive_audio())
